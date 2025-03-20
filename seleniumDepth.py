@@ -1,124 +1,112 @@
-from selenium.webdriver import ChromeOptions
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service as ChromeService
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin
-from webdriver_manager.chrome import ChromeDriverManager
-import time
+import os
+import sys
+import psutil
+import asyncio
+import requests
 from datetime import datetime
-import schedule
+from xml.etree import ElementTree
+from typing import List
+from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
 
-# Maximum depth for crawling
-MAX_DEPTH = 3
+__location__ = os.path.dirname(os.path.abspath(__file__))
+__output__ = os.path.join(__location__, "output")
+os.makedirs(__output__, exist_ok=True)
 
-def scrape_website(url):
-    """Scrape a single URL and return its HTML content."""
-    print(f"Scraping URL: {url}...")
-    options = ChromeOptions()
-    options.add_argument("--headless")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    service = ChromeService(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=options)
+# Append parent directory to system path
+parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(parent_dir)
+
+async def crawl_parallel(urls: List[str], batch_id: str, max_concurrent: int = 3):
+    print(f"\n=== Batch {batch_id} Crawling ===")
+    peak_memory = 0
+    process = psutil.Process(os.getpid())
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    def log_memory(prefix: str = ""):
+        nonlocal peak_memory
+        current_mem = process.memory_info().rss
+        if current_mem > peak_memory:
+            peak_memory = current_mem
+        print(f"{prefix} Memory: {current_mem // (1024 * 1024)} MB")
+
+    async def save_result(result, url: str):
+        """Save crawled content to markdown file"""
+        try:
+            base_name = url.replace("https://", "").replace("/", "_")[:150]
+            filename = f"{base_name}_{batch_id}_{timestamp}.md"
+            filepath = os.path.join(__output__, filename)
+
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(f"# Scraped Content from {url}\n\n")
+                f.write(f"**Crawled At:** {datetime.now().isoformat()}\n\n")
+                f.write(result.markdown)
+
+            print(f"Saved: {filename}")
+        except Exception as e:
+            print(f"Failed to save {url}: {str(e)}")
+
+    browser_config = BrowserConfig(
+        headless=True,
+        verbose=False,
+        extra_args=["--disable-gpu", "--disable-dev-shm-usage", "--no-sandbox"],
+    )
+    crawl_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS)
+
+    crawler = AsyncWebCrawler(config=browser_config)
+    await crawler.start()
+
     try:
-        driver.get(url)
-        print("Waiting for initial page load...")
-        time.sleep(20)
-        print("Waiting for dynamic content to load...")
-        time.sleep(15)
-        return driver.page_source
+        success_count = 0
+        fail_count = 0
+        for i in range(0, len(urls), max_concurrent):
+            batch = urls[i : i + max_concurrent]
+            tasks = [crawler.arun(url=url, config=crawl_config, session_id=f"session_{batch_id}_{i+j}") 
+                    for j, url in enumerate(batch)]
+
+            log_memory(prefix=f"Batch {batch_id} - Pre {i//max_concurrent + 1}: ")
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            log_memory(prefix=f"Batch {batch_id} - Post {i//max_concurrent + 1}: ")
+
+            for url, result in zip(batch, results):
+                if isinstance(result, Exception):
+                    print(f"Error crawling {url}: {result}")
+                    fail_count += 1
+                elif result.success:
+                    await save_result(result, url)
+                    success_count += 1
+                else:
+                    fail_count += 1
+
+        print(f"\nBatch {batch_id} Summary:")
+        print(f"  Success: {success_count}")
+        print(f"  Failures: {fail_count}")
+
     finally:
-        driver.quit()
+        await crawler.close()
+        log_memory(prefix="Final: ")
 
-def extract_body_content(html_content):
-    """Extract the body content from the HTML."""
-    soup = BeautifulSoup(html_content, "html.parser")
-    return str(soup.body) if soup.body else ""
-
-def clean_body_content(body_content):
-    """Clean the body content by removing scripts, styles, and unnecessary whitespace."""
-    soup = BeautifulSoup(body_content, "html.parser")
-    for element in soup(["script", "style"]):
-        element.extract()
-    text = soup.get_text(separator="\n")
-    return "\n".join(line.strip() for line in text.splitlines() if line.strip())
-
-def extract_links(html_content, base_url):
-    """Extract all valid links from the HTML content."""
-    soup = BeautifulSoup(html_content, "html.parser")
-    links = set()
-    for a_tag in soup.find_all("a", href=True):
-        href = a_tag["href"]
-        # Resolve relative URLs
-        full_url = urljoin(base_url, href)
-        # Filter links (e.g., only keep links from the same domain)
-        if full_url.startswith(base_url):
-            links.add(full_url)
-    return list(links)
-
-def scrape_with_depth(url, base_url, depth=1):
-    """Recursively scrape URLs up to a specified depth."""
-    if depth > MAX_DEPTH:
-        print(f"Reached max depth ({MAX_DEPTH}). Stopping further crawling.")
+def get_urls_from_filtered_file():
+    """Read URLs from filtered_urls.txt"""
+    try:
+        file_path = os.path.join(__location__, "filtered_urls.txt")
+        with open(file_path, "r") as f:
+            return [line.strip() for line in f if line.strip()]
+    except Exception as e:
+        print(f"Error reading URLs: {e}")
         return []
 
-    print(f"Scraping at depth {depth}: {url}")
-    try:
-        # Scrape the current page
-        html = scrape_website(url)
-        cleaned = clean_body_content(extract_body_content(html))
+async def main():
+    urls = get_urls_from_filtered_file()
+    if urls:
+        print(f"Found {len(urls)} URLs")
+        await crawl_parallel(urls, "initial", 10)
         
-        # Save the cleaned content
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"{url.replace('https://', '').replace('/', '_')}_{timestamp}.txt"
-        with open(filename, "w", encoding="utf-8") as f:
-            f.write(cleaned)
-        print(f"Saved: {filename}")
-
-        # Extract links for deeper crawling
-        links = extract_links(html, base_url)
-        print(f"Found {len(links)} links at depth {depth}")
-
-        # Recursively scrape links at the next depth level
-        for link in links:
-            scrape_with_depth(link, base_url, depth + 1)
-
-    except Exception as e:
-        print(f"Failed to scrape {url}: {str(e)}")
-
-def process_batch(batch_id):
-    """Handle batch processing with unique filenames."""
-    with open("filtered_urls.txt", "r") as f:
-        urls = [line.strip() for line in f.readlines() if line.strip()]
-    
-    for url in urls:
-        try:
-            print(f"\n=== Starting depth-based scrape for {url} ===")
-            scrape_with_depth(url, base_url=url, depth=1)
-        except Exception as e:
-            print(f"Failed batch processing for {url}: {str(e)}")
-
-def run_scheduler():
-    """Configurable scheduler controller."""
-    # For testing: 2 minutes interval, runs once
-    # For production: Change to every(2).days
-    schedule.every(2).minutes.do(lambda: process_batch("rescheduled"))
-    
-    while True:
-        n_jobs = len(schedule.get_jobs())
-        if n_jobs == 0:
-            break
-        print(f"\nNext run: {schedule.next_run()}", flush=True)
-        schedule.run_pending()
-        time.sleep(1)
+        # Scheduled crawl
+        print("\n=== Scheduling next crawl ===")
+        await asyncio.sleep(120)
+        await crawl_parallel(urls, "scheduled", 10)
+    else:
+        print("No URLs found")
 
 if __name__ == "__main__":
-    # Initial run
-    print("=== Starting initial scrape ===")
-    process_batch("initial")
-    
-    # Start scheduler (will run once for testing)
-    print("\n=== Starting scheduler ===")
-    run_scheduler()
-    
-    print("\n=== All scheduled jobs completed ===")
+    asyncio.run(main())
