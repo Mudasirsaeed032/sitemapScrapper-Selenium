@@ -1,3 +1,11 @@
 filtered_urls.txt
 *.txt
 *www*.txt
+*.md
+
+node_modules/
+
+__pycache__/
+*.pyc
+
+output/

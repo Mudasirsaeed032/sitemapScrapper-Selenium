@@ -2,10 +2,10 @@ import os
 import sys
 import psutil
 import asyncio
-import requests
+import json
 from datetime import datetime
-from xml.etree import ElementTree
 from typing import List
+from urllib.parse import urlparse
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
 
 __location__ = os.path.dirname(os.path.abspath(__file__))
@@ -30,18 +30,41 @@ async def crawl_parallel(urls: List[str], batch_id: str, max_concurrent: int = 3
         print(f"{prefix} Memory: {current_mem // (1024 * 1024)} MB")
 
     async def save_result(result, url: str):
-        """Save crawled content to markdown file"""
+        """Save crawled content to markdown and json files"""
         try:
             base_name = url.replace("https://", "").replace("/", "_")[:150]
-            filename = f"{base_name}_{batch_id}_{timestamp}.md"
-            filepath = os.path.join(__output__, filename)
+            
+            # Generate filenames
+            md_filename = f"{base_name}_{batch_id}_{timestamp}.md"
+            json_filename = f"{base_name}_{batch_id}_{timestamp}.json"
+            md_path = os.path.join(__output__, md_filename)
+            json_path = os.path.join(__output__, json_filename)
 
-            with open(filepath, "w", encoding="utf-8") as f:
-                f.write(f"# Scraped Content from {url}\n\n")
-                f.write(f"**Crawled At:** {datetime.now().isoformat()}\n\n")
-                f.write(result.markdown)
+            # Extract university name from URL
+            parsed_url = urlparse(url)
+            domain_parts = parsed_url.netloc.replace("www.", "").split(".")
+            university_name = " ".join([part.capitalize() for part in domain_parts[:2]])
 
-            print(f"Saved: {filename}")
+            # Prepare content
+            md_content = f"# Scraped Content from {url}\n\n"
+            md_content += f"**Crawled At:** {datetime.now().isoformat()}\n\n"
+            md_content += result.markdown
+
+            # Write markdown
+            with open(md_path, "w", encoding="utf-8") as f:
+                f.write(md_content)
+
+            # Write JSON
+            json_data = {
+                "University Name": university_name,
+                "Link": url,
+                "Content": result.markdown
+            }
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(json_data, f, indent=2)
+
+            print(f"Saved: {md_filename} and {json_filename}")
+            
         except Exception as e:
             print(f"Failed to save {url}: {str(e)}")
 
